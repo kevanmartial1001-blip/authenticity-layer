@@ -1,8 +1,22 @@
 import type { VercelRequest, VercelResponse } from "vercel";
 import { RewriteInput } from "../lib/schema";
 
+// NEW: metrics helpers
+import { calmnessDelta, detectAcceptedPlan } from "../lib/metrics";
+
 const SHEETS_URL = process.env.SHEETS_WEBHOOK_URL!;
 const API_KEY = process.env.SHEETS_API_KEY || "";
+
+async function postToSheets(op: string, payload: Record<string, any>) {
+  if (!SHEETS_URL) return;
+  try {
+    await fetch(SHEETS_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ op, apiKey: API_KEY, ...payload }),
+    });
+  } catch { /* non-blocking */ }
+}
 
 function mergeDNA(base: any = {}, override: any = {}) {
   return {
@@ -25,17 +39,6 @@ async function fetchProfileDNA(userId: string): Promise<any> {
     const j = await r.json();
     return j?.ok ? (j.profile || {}) : {};
   } catch { return {}; }
-}
-
-async function logToSheets(payload: Record<string, any>) {
-  if (!SHEETS_URL) return;
-  try {
-    await fetch(SHEETS_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ op: "log", apiKey: API_KEY, ...payload })
-    });
-  } catch { /* non-blocking */ }
 }
 
 function templateRender(input: RewriteInput): string {
@@ -106,9 +109,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // 1) Load per-user Voice DNA if userId present; merge with provided dna
     let mergedDNA = body.dna || {};
-    if ((body as any).userId) {
-      const prof = await fetchProfileDNA((body as any).userId);
-      // Apps Script returns { tone/lexicon/style... } as profile
+    const userId = (body as any).userId || "";
+    const sessionId = (body as any).sessionId || "";
+    if (userId) {
+      const prof = await fetchProfileDNA(userId);
       mergedDNA = mergeDNA(prof, mergedDNA);
     }
     body.dna = mergedDNA;
@@ -118,16 +122,47 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const outText = await llmRender(body, max);
     const mode = process.env.OPENAI_API_KEY ? "llm" : "template";
 
-    // 3) Log to Sheets (non-blocking). We don’t log the original user text here (that’s in interpret),
-    //    but we stitch by sessionId/userId.
-    logToSheets({
-      userId: (body as any).userId || "",
-      sessionId: (body as any).sessionId || "",
-      input: "",                     // interpret holds input
+    // 3) Logs history
+    postToSheets("log", {
+      userId, sessionId,
+      input: "",
       state: body.state,
       move: body.move,
       output: outText,
       meta: { channel: body.channel, source: "rewrite", mode }
+    });
+
+    // 4) Update Latest snapshot
+    postToSheets("upsertLatest", {
+      userId, sessionId,
+      input: "",
+      output: outText,
+      move: body.move,
+      state: body.state
+    });
+
+    // 5) User Progress (user-facing journey metrics)
+    // NOTE: for MVP, we don't have prev turn state → calmness_delta≈0; if you pass prev_state, calmnessDelta will reflect it.
+    const calm_delta = calmnessDelta(body.state as any, body.state as any); // MVP: 0
+    const accepted = detectAcceptedPlan(outText);
+
+    postToSheets("userProgress", {
+      ts: new Date().toISOString(),
+      userId, sessionId,
+      goals_snapshot: JSON.stringify([]),
+      momentum_score: (body.state as any).momentum ?? 0.5,
+      calmness_delta: calm_delta,
+      agency_score: (body.state as any).agency_signal ?? 0.5,
+      reflection_depth: (body.state as any).reflection_depth ?? 0.5,
+      accepted_plan: accepted,
+      milestone: ""
+    });
+
+    // 6) Telemetry update (company view)
+    postToSheets("telemetryUpdate", {
+      ts: new Date().toISOString(),
+      userId, sessionId,
+      personalization_ratio: (Object.keys((body as any).dna || {}).length ? 0.6 : 0.2)
     });
 
     return res.status(200).json({ ok: true, output: outText, mode, dnaUsed: mergedDNA });
