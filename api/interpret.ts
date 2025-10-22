@@ -3,9 +3,24 @@ import { detectState } from "../lib/state";
 import { chooseMove } from "../lib/policy";
 import { InterpretInput, InterpretOutput } from "../lib/schema";
 
-// ---- Helpers: Sheets + Policies + Guardrails ----
+// NEW: RFE helpers
+import { extraSignals } from "../lib/signal";
+import { inferArchetype } from "../lib/personality";
+
+// ---- Sheets plumbing ----
 const SHEETS_URL = process.env.SHEETS_WEBHOOK_URL!;
 const API_KEY = process.env.SHEETS_API_KEY || "";
+
+async function postToSheets(op: string, payload: Record<string, any>) {
+  if (!SHEETS_URL) return;
+  try {
+    await fetch(SHEETS_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ op, apiKey: API_KEY, ...payload }),
+    });
+  } catch { /* non-blocking */ }
+}
 
 async function fetchPolicies(): Promise<Record<string, any>> {
   if (!SHEETS_URL) return {};
@@ -63,18 +78,11 @@ function applyPolicyToMove(
   state: Record<string, number>,
   policies: Record<string, any>
 ): string {
-  // Example knobs (all optional). If absent, no change.
-  // Policies sheet keys (examples):
-  //  - move_ack_threshold = 0.35
-  //  - move_challenge_guardrail = "fatigue<0.6 && momentum>0.7"
-  //  - move_override = "ACKNOWLEDGE"  (hard override for testing)
-  //  - move_demote_if_fatigue_ge = 0.8 -> demote any CHALLENGE to REFLECT
-
   if (policies.move_override) return String(policies.move_override);
 
   let move = initialMove;
 
-  // Guardrail: challenge allowed?
+  // Guardrail: CHALLENGE allowed?
   const guard = String(policies.move_challenge_guardrail || "");
   if (move === "CHALLENGE" && guard && !evalGuardrail(guard, state)) {
     move = "REFLECT";
@@ -82,25 +90,12 @@ function applyPolicyToMove(
 
   // Demote on extreme fatigue
   const fatigueDemote = parseNumber(policies.move_demote_if_fatigue_ge, NaN);
-  if (move === "CHALLENGE" && Number.isFinite(fatigueDemote) && state.fatigue >= fatigueDemote) {
+  if (move === "CHALLENGE" && Number.isFinite(fatigueDemote) && (state as any).fatigue >= fatigueDemote) {
     move = "REFLECT";
   }
 
   return move;
 }
-
-async function logToSheets(payload: Record<string, any>) {
-  if (!SHEETS_URL) return;
-  try {
-    await fetch(SHEETS_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ op: "log", apiKey: API_KEY, ...payload })
-    });
-  } catch { /* non-blocking */ }
-}
-
-// -------------------------------------------------
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") return res.status(405).send("Use POST");
@@ -110,13 +105,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(400).json({ error: "message and channel required" });
     }
 
+    // 1) Base state + extra signals for RFE
     const state = detectState(body.message);
+    const sig = {
+      ...extraSignals(body.message),
+      momentum: state.momentum,
+      confidence: state.confidence,
+      fatigue: state.fatigue,
+      openness: state.openness,
+    } as any;
 
-    // Pull live policies and apply to move selection
+    // 2) Personality inference (cheap v1)
+    const archetype = inferArchetype(sig);
+
+    // 3) Live policies + move selection
     const policies = await fetchPolicies();
-
-    // If your lib/policy.chooseMove accepts (state, policies) use that; otherwise call normally:
-    const picked = chooseMove.length >= 2
+    const picked = (chooseMove.length >= 2)
       ? (chooseMove as any)(state, policies)
       : chooseMove(state);
 
@@ -127,15 +131,44 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const out: InterpretOutput = { state, move, rationale, constraints };
 
-    // Log to Sheets (non-blocking)
-    logToSheets({
-      userId: body.userId || "",
-      sessionId: body.sessionId || "",
+    // 4) Logs (history), Latest (snapshot), Telemetry (company view), Personalities (upsert)
+    const userId = (body as any).userId || "";
+    const sessionId = (body as any).sessionId || "";
+
+    // Logs
+    postToSheets("log", {
+      userId, sessionId,
       input: body.message,
-      state,
-      move,
-      output: "",                 // filled by /api/rewrite
+      state, move, output: "",
       meta: { channel: body.channel, source: "interpret", policiesUsed: !!Object.keys(policies).length }
+    });
+
+    // Latest snapshot (one line per user)
+    postToSheets("upsertLatest", {
+      userId, sessionId,
+      input: body.message, output: "",
+      move, state
+    });
+
+    // Telemetry append
+    postToSheets("telemetry", {
+      ts: new Date().toISOString(),
+      userId, sessionId,
+      move,
+      signals_json: JSON.stringify(sig),
+      archetype,
+      used_policies: Object.keys(policies||{}).join(","),
+      personalization_ratio: 0,  // will be updated by /rewrite
+      repair_used: false
+    });
+
+    // Personality upsert
+    postToSheets("upsertPersonality", {
+      userId,
+      archetype,
+      trust: 0.6,
+      preferred_pacing: "short",
+      weights_json: "{}"
     });
 
     return res.status(200).json({ ok: true, result: out });
