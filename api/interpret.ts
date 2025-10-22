@@ -3,12 +3,12 @@ import { detectState } from "../lib/state";
 import { chooseMove } from "../lib/policy";
 import { InterpretInput, InterpretOutput } from "../lib/schema";
 
-// NEW: RFE helpers
+// RFE helpers
 import { extraSignals } from "../lib/signal";
 import { inferArchetype } from "../lib/personality";
 
 // ---- Sheets plumbing ----
-const SHEETS_URL = process.env.SHEETS_WEBHOOK_URL!;
+const SHEETS_URL = process.env.SHEETS_WEBHOOK_URL || "";
 const API_KEY = process.env.SHEETS_API_KEY || "";
 
 async function postToSheets(op: string, payload: Record<string, any>) {
@@ -18,8 +18,11 @@ async function postToSheets(op: string, payload: Record<string, any>) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ op, apiKey: API_KEY, ...payload }),
+      cache: "no-store",
     });
-  } catch { /* non-blocking */ }
+  } catch {
+    /* non-blocking */
+  }
 }
 
 async function fetchPolicies(): Promise<Record<string, any>> {
@@ -28,7 +31,8 @@ async function fetchPolicies(): Promise<Record<string, any>> {
     const r = await fetch(SHEETS_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ op: "getPolicies", apiKey: API_KEY })
+      body: JSON.stringify({ op: "getPolicies", apiKey: API_KEY }),
+      cache: "no-store",
     });
     const j = await r.json();
     return j?.ok ? (j.policies || {}) : {};
@@ -47,15 +51,15 @@ function evalGuardrail(expr: string, state: Record<string, number>): boolean {
   if (!expr || typeof expr !== "string") return true;
   // Only allow: [a-z_]+ <|<=|>|>= number, joined by && or ||
   const tokens = expr.split(/\s*(\&\&|\|\|)\s*/);
-  let valueStack: boolean[] = [];
-  let opStack: string[] = [];
+  const valueStack: boolean[] = [];
+  const opStack: string[] = [];
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i].trim();
     if (t === "&&" || t === "||") { opStack.push(t); continue; }
     const m = t.match(/^([a-z_]+)\s*(<=|<|>=|>)\s*([0-9]*\.?[0-9]+)$/i);
     if (!m) return true; // fail-open
     const [, k, op, numStr] = m;
-    const left = Number(state[k] ?? 0);
+    const left = Number((state as any)[k] ?? 0);
     const right = Number(numStr);
     let ok = true;
     if (op === "<") ok = left < right;
@@ -64,7 +68,6 @@ function evalGuardrail(expr: string, state: Record<string, number>): boolean {
     else if (op === ">=") ok = left >= right;
     valueStack.push(ok);
   }
-  // Reduce booleans with ops in sequence
   let res = valueStack.shift() ?? true;
   for (const op of opStack) {
     const next = valueStack.shift() ?? true;
@@ -131,7 +134,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const out: InterpretOutput = { state, move, rationale, constraints };
 
-    // 4) Logs (history), Latest (snapshot), Telemetry (company view), Personalities (upsert)
+    // 4) Logs (history), Latest (snapshot), Telemetry, Personalities
     const userId = (body as any).userId || "";
     const sessionId = (body as any).sessionId || "";
 
@@ -158,7 +161,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       signals_json: JSON.stringify(sig),
       archetype,
       used_policies: Object.keys(policies||{}).join(","),
-      personalization_ratio: 0,  // will be updated by /rewrite
+      personalization_ratio: 0,  // updated by /rewrite
       repair_used: false
     });
 
