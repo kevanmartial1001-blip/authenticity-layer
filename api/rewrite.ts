@@ -4,7 +4,7 @@ import { RewriteInput } from "../lib/schema";
 // NEW: metrics helpers
 import { calmnessDelta, detectAcceptedPlan } from "../lib/metrics";
 
-const SHEETS_URL = process.env.SHEETS_WEBHOOK_URL!;
+const SHEETS_URL = process.env.SHEETS_WEBHOOK_URL || "";
 const API_KEY = process.env.SHEETS_API_KEY || "";
 
 async function postToSheets(op: string, payload: Record<string, any>) {
@@ -14,8 +14,11 @@ async function postToSheets(op: string, payload: Record<string, any>) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ op, apiKey: API_KEY, ...payload }),
+      cache: "no-store",
     });
-  } catch { /* non-blocking */ }
+  } catch {
+    /* non-blocking */
+  }
 }
 
 function mergeDNA(base: any = {}, override: any = {}) {
@@ -34,7 +37,8 @@ async function fetchProfileDNA(userId: string): Promise<any> {
     const r = await fetch(SHEETS_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ op: "getProfile", userId, apiKey: API_KEY })
+      body: JSON.stringify({ op: "getProfile", userId, apiKey: API_KEY }),
+      cache: "no-store",
     });
     const j = await r.json();
     return j?.ok ? (j.profile || {}) : {};
@@ -142,8 +146,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
 
     // 5) User Progress (user-facing journey metrics)
-    // NOTE: for MVP, we don't have prev turn state → calmness_delta≈0; if you pass prev_state, calmnessDelta will reflect it.
-    const calm_delta = calmnessDelta(body.state as any, body.state as any); // MVP: 0
+    // If prev_state is provided, we compute a real calmness delta; otherwise ≈0.
+    const prevState = ((body as any).prev_state || body.state) as any;
+    const calm_delta = calmnessDelta(prevState, body.state as any);
     const accepted = detectAcceptedPlan(outText);
 
     postToSheets("userProgress", {
