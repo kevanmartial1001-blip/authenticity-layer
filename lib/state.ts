@@ -1,17 +1,16 @@
 import { LatentState } from "./schema";
 
 export function detectState(message: string): LatentState {
-  const msg = message.trim();
-  const len = msg.length;
+  const msg = (message || "").trim();
 
   const hasExclaim = /!/.test(msg);
-  const hasMaybe = /\bmaybe|might|perhaps\b/i.test(msg);
+  const hasMaybe = /\b(maybe|might|perhaps)\b/i.test(msg);
   const negSelf = /\b(i can't|i cannot|i'm not good|i give up|forget it)\b/i.test(msg);
   const tired = /\b(tired|exhausted|drained|burnt|burned)\b/i.test(msg);
   const excited = /\b(excited|let's go|can't wait|pumped)\b/i.test(msg);
   const questions = (msg.match(/\?/g) || []).length;
 
-  // crude heuristics; we’ll learn later
+  // crude heuristics; to be learned later
   let momentum = 0.5;
   let confidence = 0.5;
   let fatigue = 0.3;
@@ -24,12 +23,11 @@ export function detectState(message: string): LatentState {
   if (hasExclaim) { momentum += 0.1; }
   if (questions > 0) { openness += 0.1; }
 
-  // normalize + clamp
   const clamp = (n: number) => Math.max(0, Math.min(1, n));
   return {
     momentum: clamp(momentum),
     confidence: clamp(confidence),
     fatigue: clamp(fatigue),
-    openness: clamp(openness)
+    openness: clamp(openness),
   };
 }
